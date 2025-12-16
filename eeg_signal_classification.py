@@ -21,8 +21,8 @@ parser.add_argument('-sn', '--split-num', default=0, type=int, help="split numbe
 parser.add_argument('-sub','--subject', default=0   , type=int, help="choose a subject from 1 to 6, default is 0 (all subjects)")
 
 #Time options: select from 20 to 460 samples from EEG data
-parser.add_argument('-tl', '--time_low', default=20, type=float, help="lowest time value")
-parser.add_argument('-th', '--time_high', default=460,  type=float, help="highest time value")
+parser.add_argument('-tl', '--time_low', default=20, type=int, help="lowest time value")
+parser.add_argument('-th', '--time_high', default=460,  type=int, help="highest time value")
 
 # Model type/options
 parser.add_argument('-mt','--model_type', default='lstm', help='specify which generator should be used: lstm|EEGChannelNet')
@@ -39,10 +39,13 @@ parser.add_argument('-lr', '--learning-rate', default=0.001, type=float, help="l
 parser.add_argument('-lrdb', '--learning-rate-decay-by', default=0.5, type=float, help="learning rate decay factor")
 parser.add_argument('-lrde', '--learning-rate-decay-every', default=10, type=int, help="learning rate decay period")
 parser.add_argument('-dw', '--data-workers', default=4, type=int, help="data loading workers")
-parser.add_argument('-e', '--epochs', default=200, type=int, help="training epochs")
+parser.add_argument('-e', '--epochs', default=100, type=int, help="training epochs")
+parser.add_argument('-wd', '--weight-decay', default=0.0001, type=float, help="weight decay (L2 regularization)")
+parser.add_argument('-es', '--early-stopping', default=20, type=int, help="early stopping patience (epochs)")
 
 # Save options
 parser.add_argument('-sc', '--saveCheck', default=100, type=int, help="learning rate")
+parser.add_argument('-csv', '--csv-file', default='results.csv', help="CSV file to save results")
 
 # Backend options
 parser.add_argument('--no-cuda', default=False, help="disable CUDA", action="store_true")
@@ -57,6 +60,7 @@ import os
 import random
 import math
 import time
+import csv
 import torch; torch.utils.backcompat.broadcast_warning.enabled = True
 from torch.utils.data import DataLoader
 from torchvision import transforms, datasets
@@ -97,7 +101,7 @@ class EEGDataset:
         eeg = self.data[i]["eeg"].float().t()
         eeg = eeg[opt.time_low:opt.time_high,:]
 
-        if opt.model_type == "model10":
+        if opt.model_type == "model10" or opt.model_type == "EEGChannelNet":
             eeg = eeg.t()
             eeg = eeg.view(1,128,opt.time_high-opt.time_low)
         # Get label
@@ -142,7 +146,7 @@ model_options = {key: int(value) if value.isdigit() else (float(value) if value[
 # Create discriminator model/optimizer
 module = importlib.import_module("models." + opt.model_type)
 model = module.Model(**model_options)
-optimizer = getattr(torch.optim, opt.optim)(model.parameters(), lr = opt.learning_rate)
+optimizer = getattr(torch.optim, opt.optim)(model.parameters(), lr = opt.learning_rate, weight_decay = opt.weight_decay)
     
 # Setup CUDA
 if not opt.no_cuda:
@@ -160,6 +164,7 @@ accuracies_per_epoch={"train":[],"val":[],"test":[]}
 best_accuracy = 0
 best_accuracy_val = 0
 best_epoch = 0
+early_stopping_counter = 0
 # Start training
 
 predicted_labels = [] 
@@ -213,6 +218,14 @@ for epoch in range(1, opt.epochs+1):
         best_accuracy_val = accuracies["val"]/counts["val"]
         best_accuracy = accuracies["test"]/counts["test"]
         best_epoch = epoch
+        early_stopping_counter = 0  # Reset counter when validation improves
+    else:
+        early_stopping_counter += 1
+    
+    # Early stopping check
+    if early_stopping_counter >= opt.early_stopping:
+        print(f"\nEarly stopping triggered after {opt.early_stopping} epochs without improvement")
+        break
     
     TrL,TrA,VL,VA,TeL,TeA=  losses["train"]/counts["train"],accuracies["train"]/counts["train"],losses["val"]/counts["val"],accuracies["val"]/counts["val"],losses["test"]/counts["test"],accuracies["test"]/counts["test"]
     print("Model: {11} - Subject {12} - Time interval: [{9}-{10}]  [{9}-{10} Hz] - Epoch {0}: TrL={1:.4f}, TrA={2:.4f}, VL={3:.4f}, VA={4:.4f}, TeL={5:.4f}, TeA={6:.4f}, TeA at max VA = {7:.4f} at epoch {8:d}".format(epoch,
@@ -233,4 +246,44 @@ for epoch in range(1, opt.epochs+1):
 
     if epoch%opt.saveCheck == 0:
                 torch.save(model, '%s__subject%d_epoch_%d.pth' % (opt.model_type, opt.subject,epoch))
-            
+
+# Save final results to CSV
+# Detect frequency band from dataset path
+freq_band = 'unknown'
+if 'eeg_5_95' in opt.eeg_dataset:
+    freq_band = '5-95Hz'
+elif 'eeg_14_70' in opt.eeg_dataset:
+    freq_band = '14-70Hz'
+elif 'eeg_55_95' in opt.eeg_dataset:
+    freq_band = '55-95Hz'
+
+csv_exists = os.path.isfile(opt.csv_file)
+with open(opt.csv_file, 'a', newline='') as csvfile:
+    fieldnames = ['model', 'subject', 'freq_band', 'time_low', 'time_high', 'best_epoch', 'best_val_accuracy', 'best_test_accuracy', 
+                  'final_train_accuracy', 'final_val_accuracy', 'final_test_accuracy',
+                  'final_train_loss', 'final_val_loss', 'final_test_loss']
+    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+    
+    if not csv_exists:
+        writer.writeheader()
+    
+    writer.writerow({
+        'model': opt.model_type,
+        'subject': opt.subject,
+        'freq_band': freq_band,
+        'time_low': opt.time_low,
+        'time_high': opt.time_high,
+        'best_epoch': best_epoch,
+        'best_val_accuracy': best_accuracy_val,
+        'best_test_accuracy': best_accuracy,
+        'final_train_accuracy': accuracies_per_epoch['train'][-1],
+        'final_val_accuracy': accuracies_per_epoch['val'][-1],
+        'final_test_accuracy': accuracies_per_epoch['test'][-1],
+        'final_train_loss': losses_per_epoch['train'][-1],
+        'final_val_loss': losses_per_epoch['val'][-1],
+        'final_test_loss': losses_per_epoch['test'][-1]
+    })
+
+print(f"\nResults saved to {opt.csv_file}")
+print(f"Best validation accuracy: {best_accuracy_val:.4f} at epoch {best_epoch}")
+print(f"Test accuracy at best validation: {best_accuracy:.4f}")
